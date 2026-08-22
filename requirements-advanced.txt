@@ -1,0 +1,4 @@
+# Optional packages used for EBM, SHAP, and LIME panels.
+interpret>=0.6
+shap>=0.45
+lime>=0.2.0.1
