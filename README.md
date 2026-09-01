@@ -7,7 +7,8 @@ An end-to-end Streamlit dashboard built from the supplied child-mortality CSVs a
 - Reconstructs a country-year panel by joining mortality, health expenditure, female education, poverty, GDP, bed-net, breastfeeding and pneumonia-care indicators on `Code + Year`.
 - Applies country-only time interpolation for numeric indicators, preserving the source data's geographic boundaries.
 - Clusters countries by normalized cause-of-death composition (infectious, neonatal/congenital, other), not wealth.
-- Trains a Random Forest mortality model, reports global feature importance and generates local SHAP explanations when SHAP is available.
+- Uses an Explainable Boosting Machine (EBM) as the forecasting and decision model, evaluated on countries withheld from training.
+- Uses the previous observed country mortality rate plus socioeconomic indicators for one-year-ahead EBM forecasting; reports EBM local contributions and optional EBM SHAP/LIME explanations.
 - Forecasts each country’s 2030 under-five mortality rate from its most recent ten-year trajectory and compares it with SDG 3.2 (≤25 deaths/1,000 live births).
 - Includes an interactive counterfactual policy simulator and illustrative cost-effectiveness table.
 

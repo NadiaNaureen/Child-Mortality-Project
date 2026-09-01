@@ -2,22 +2,20 @@
 from __future__ import annotations
 
 from pathlib import Path
-import re
-
 import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans
-from sklearn.ensemble import RandomForestRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.model_selection import GroupShuffleSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 DATA_DIR = Path(__file__).parent / "child mortality dataset"
 KEYS = ["Entity", "Code", "Year"]
 TARGET = "under5_mortality_per_1000"
-FEATURES = ["health_spend_ppp", "female_school_years", "poverty_share", "gdp_per_capita_ppp"]
+FEATURES = ["prior_u5mr", "health_spend_ppp", "female_school_years", "poverty_share", "gdp_per_capita_ppp"]
 CLUSTER_LABELS = {0: "Transition / mixed", 1: "Infectious & hygiene-heavy", 2: "Neonatal & congenital-heavy"}
 
 
@@ -59,6 +57,9 @@ def build_panel() -> pd.DataFrame:
     for source in inputs:
         panel = panel.merge(source, on=KEYS, how="left")
     panel = panel.dropna(subset=["Code", TARGET]).sort_values(["Code", "Year"])
+    # One-year lag gives the forecasting model the last observed country rate,
+    # which is information that would be available at prediction time.
+    panel["prior_u5mr"] = panel.groupby("Code")[TARGET].shift(1)
     numeric = [c for c in panel.columns if c not in ["Entity", "Code", "Year"]]
     panel[numeric] = panel.groupby("Code")[numeric].transform(
         lambda g: g.interpolate(limit_direction="both")
@@ -96,22 +97,40 @@ def build_clusters() -> tuple[pd.DataFrame, list[str]]:
 
 
 def train_models(panel: pd.DataFrame):
+    """Fit production models and compare them on countries held out from training.
+
+    Holding out whole countries avoids treating adjacent years of the same country as
+    independent test records, which gives a more realistic generalisation estimate.
+    """
     sample = panel.dropna(subset=[TARGET]).copy()
     sample = sample[sample[FEATURES].notna().sum(axis=1) >= 2]
+    # The prediction interface is a present-day country decision tool. Retaining the
+    # latest observation per country prevents older repeated observations from
+    # dominating the validation score and keeps interactive retraining responsive.
+    sample = sample.sort_values(["Code", "Year"]).groupby("Code", as_index=False).tail(1).copy()
     X, y = sample[FEATURES], sample[TARGET]
-    model = Pipeline([("imputer", SimpleImputer(strategy="median")), ("rf", RandomForestRegressor(n_estimators=300, min_samples_leaf=2, random_state=42, n_jobs=-1))])
-    model.fit(X, y)
-    pred = model.predict(X)
-    importances = pd.DataFrame({"feature": FEATURES, "importance": model.named_steps["rf"].feature_importances_}).sort_values("importance", ascending=False)
-    metrics = {"rows": len(sample), "rf_mae_in_sample": mean_absolute_error(y, pred), "rf_r2_in_sample": r2_score(y, pred)}
+    train_index, test_index = next(GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=42).split(X, y, groups=sample["Code"]))
+    X_train, X_test = X.iloc[train_index], X.iloc[test_index]
+    y_train, y_test = y.iloc[train_index], y.iloc[test_index]
+
+    metrics = {"rows": len(sample), "test_countries": int(sample.iloc[test_index]["Code"].nunique())}
     ebm = None
     try:
         from interpret.glassbox import ExplainableBoostingRegressor
-        ebm = Pipeline([("imputer", SimpleImputer(strategy="median")), ("ebm", ExplainableBoostingRegressor(random_state=42, interactions=0, max_rounds=5000))])
-        ebm.fit(X, y)
-        ebm_pred = ebm.predict(X)
-        metrics["ebm_mae_in_sample"] = mean_absolute_error(y, ebm_pred)
-        metrics["ebm_r2_in_sample"] = r2_score(y, ebm_pred)
+        # Interactions let EBM model policy-relevant combinations such as education
+        # plus poverty, while retaining a transparent additive explanation.
+        ebm_template = Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("ebm", ExplainableBoostingRegressor(
+                random_state=42, interactions=4, outer_bags=4, max_rounds=1000,
+                learning_rate=0.04, min_samples_leaf=4, n_jobs=1,
+            )),
+        ])
+        ebm_validation = ebm_template.fit(X_train, y_train)
+        ebm_test_prediction = ebm_validation.predict(X_test)
+        metrics["ebm_mae"] = mean_absolute_error(y_test, ebm_test_prediction)
+        metrics["ebm_r2"] = r2_score(y_test, ebm_test_prediction)
+        ebm = ebm_template.fit(X, y)
     except ImportError:
         pass
     # Country-level backsliding classifier: positive if recent mortality slope is non-negative.
@@ -122,7 +141,7 @@ def train_models(panel: pd.DataFrame):
     if len(eligible) >= 20 and eligible["backsliding"].nunique() == 2:
         churn = Pipeline([("imputer", SimpleImputer(strategy="median")), ("lr", LogisticRegression(max_iter=1000, class_weight="balanced"))])
         churn.fit(eligible[FEATURES], eligible["backsliding"])
-    return model, importances, metrics, churn, ebm
+    return ebm, metrics, churn
 
 
 def forecast_sdg(panel: pd.DataFrame) -> pd.DataFrame:
@@ -145,5 +164,10 @@ def intervention_costs(cluster: str, lives_saved_per_100k: float) -> pd.DataFram
         choices = [("Advanced neonatal care (proxy)", 10_000_000), *choices]
     rows = []
     for name, cost in choices:
-        rows.append({"intervention": name, "illustrative_cost_usd_per_100k": cost, "lives_saved_per_100k": lives_saved_per_100k, "cost_per_life_saved_usd": cost / max(lives_saved_per_100k, 0.1)})
+        rows.append({
+            "intervention": name,
+            "illustrative_cost_usd_per_100k": cost,
+            "lives_saved_per_100k": lives_saved_per_100k,
+            "cost_per_life_saved_usd": cost / lives_saved_per_100k if lives_saved_per_100k > 0 else np.nan,
+        })
     return pd.DataFrame(rows)
